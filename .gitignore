@@ -1,0 +1,61 @@
+#############################
+# Python & tooling caches   #
+#############################
+__pycache__/
+*.py[cod]
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+#############################
+# Builds / packaging        #
+#############################
+build/
+dist/
+site/
+htmlcov/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+#############################
+# Virtual envs              #
+#############################
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+#############################
+# Logs                      #
+#############################
+logs/
+*.log
+
+#############################
+# Project data / secrets    #
+#############################
+.env
+.env.*
+!.env.example
+data/
+models/
+models/id_ed25519*
+
+# Prompt files: ignore only local/private variants; keep examples in repo
+prompts/local*.txt
+prompts/*.private.txt
+prompts/*.secret.txt
+!prompts/*.example.txt
+
+#############################
+# Editor / OS files         #
+#############################
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

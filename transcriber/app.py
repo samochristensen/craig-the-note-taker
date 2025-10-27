@@ -7,6 +7,14 @@ MODEL  = os.environ.get("WHISPERX_MODEL","large-v2")
 
 app = FastAPI()
 
+@app.get("/")
+def index():
+    return {"ok": True, "service": "transcriber", "endpoints": ["/transcribe", "/health"]}
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 class Job(BaseModel):
     session_id: str
 

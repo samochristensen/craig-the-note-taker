@@ -74,13 +74,14 @@ else
   info "Bot service network_mode: $netmode"
 fi
 
+transcriber_port_issue=0
 if [[ "$netmode" == "host" ]]; then
   transcriber_block="$(docker compose -f "$COMPOSE" config 2>/dev/null | awk "/${TRANSCRIBER_SVC}:/,/^[a-z]/")"
   if ! grep -qE '^\s*ports:\s*$' <<<"$transcriber_block" || ! grep -qE '^\s*-\s*"?8000:8000"?' <<<"$transcriber_block"; then
-    bad "Transcriber is not published on 8000 while bot is in host mode. Add: ports: [\"8000:8000\"] to ${TRANSCRIBER_SVC}."
-    need_fix=1
+    warn "Could not confirm transcriber port 8000 mapping from static config; will verify at runtime."
+    transcriber_port_issue=1
   else
-    ok "Transcriber port appears published."
+    ok "Transcriber port appears published by compose config."
   fi
   if [[ "$TRANSCRIBER_URL" != http://127.0.0.1:8000 && "$TRANSCRIBER_URL" != http://localhost:8000 ]]; then
     warn "TRANSCRIBER_URL should be http://127.0.0.1:8000 when bot uses host networking."
@@ -103,6 +104,26 @@ OLLAMA_CTN="$(docker ps --format '{{.Names}}' | grep -E "^${PROJECT}-${OLLAMA_SV
 # Early exit if core services down
 if (( need_fix )); then
   echo "Fix the above and re-run."; exit 2
+fi
+
+# 3.5) If static check failed, verify port mapping / health at runtime
+if [[ "$netmode" == "host" && "$transcriber_port_issue" -eq 1 && -n "$TRANSCRIBER_CTN" ]]; then
+  info "Verifying transcriber 8000 mapping at runtime…"
+  ports_line="$(docker ps --format '{{.Names}} {{.Ports}}' | awk '$1=="'"$TRANSCRIBER_CTN"'"{print substr($0, index($0,$2))}')"
+  if grep -qE '0.0.0.0:8000->8000' <<<"$ports_line"; then
+    ok "Transcriber port 8000 is published at runtime."
+    transcriber_port_issue=0
+  fi
+  if (( transcriber_port_issue )); then
+    if curl -fsS "http://127.0.0.1:8000/health" >/dev/null 2>&1; then
+      ok "Transcriber health reachable on host port 8000."
+      transcriber_port_issue=0
+    fi
+  fi
+  if (( transcriber_port_issue )); then
+    bad "Transcriber is not published on 8000 while bot is in host mode. Add: ports: [\"8000:8000\"] to ${TRANSCRIBER_SVC}."
+    need_fix=1
+  fi
 fi
 
 # 4) Inside the bot: py-cord version & opus

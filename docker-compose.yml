@@ -1,0 +1,43 @@
+services:
+  discord-bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # Voice works best without Docker NAT
+    network_mode: host
+    env_file: .env
+    environment:
+      OLLAMA_HOST: ${OLLAMA_HOST}
+      LLM_MODEL: ${LLM_MODEL}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID}
+      DISCORD_POST_CHANNEL_ID: ${DISCORD_POST_CHANNEL_ID}
+      TRANSCRIBER_URL: ${TRANSCRIBER_URL}
+    volumes:
+      - ./data:/app/data
+      - ./prompts:/app/prompts
+    depends_on:
+      - transcriber
+      - ollama
+
+  transcriber:
+    build: ./transcriber
+    restart: unless-stopped
+    ports:
+      - "8000:8000"           # exposed so host-net bot can reach it
+    environment:
+      WHISPERX_DEVICE: ${WHISPERX_DEVICE:-cpu}
+      WHISPERX_MODEL: ${WHISPERX_MODEL:-small}
+    volumes:
+      - ./data:/app/data
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "11434:11434"         # exposed so host-net bot can reach it
+    environment:
+      OLLAMA_HOST: 0.0.0.0
+    volumes:
+      - ./models:/root/.ollama

@@ -2,6 +2,15 @@ import os, io, json, time, asyncio, aiohttp, requests, logging, socket, struct
 import discord
 from discord.ext import commands
 
+# ── Logging Setup ───────────────────────────────────────────────────────────
+LOG_LEVEL = os.environ.get("BOT_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("discord_bot")
+
 # ── Env ─────────────────────────────────────────────────────────────────────────
 TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GUILD_ID = int(os.environ["DISCORD_GUILD_ID"])
@@ -60,8 +69,9 @@ def chunk_text(t: str, n: int):
 try:
     if not discord.opus.is_loaded():
         discord.opus.load_opus('libopus.so.0')  # provided by libopus0
+    logger.info("Opus codec loaded successfully")
 except Exception as e:
-    print("Warning: could not load Opus:", e)
+    logger.warning(f"Could not load Opus codec: {e}")
 
 # ── Slash Commands (Pycord style) ──────────────────────────────────────────────
 def _ctx_replied(ctx: discord.ApplicationContext) -> bool:
@@ -354,60 +364,77 @@ async def stopnotes(ctx: discord.ApplicationContext):
 # ── Recording finished callback ────────────────────────────────────────────────
 async def finished_callback(sink: discord.sinks.Sink, post_channel_id: int, guild_id: int, sid: str, session_dir: str):
     """After stop_recording(): save WAVs, transcribe, summarize, post, disconnect."""
+    logger.info(f"Processing finished recording for session {sid}")
     channel = bot.get_channel(post_channel_id)
 
     # Save per-user WAV files
     for user_id, audio in sink.audio_data.items():
         out_path = os.path.join(session_dir, f"user_{user_id}.wav")
+        # CRITICAL: Reset file pointer to start before reading
+        # BytesIO objects from discord.sinks have their pointer at EOF after recording
+        audio.file.seek(0)
         with open(out_path, "wb") as f:
-            f.write(audio.file.read())
+            bytes_written = f.write(audio.file.read())
+            logger.debug(f"Saved {bytes_written} bytes for user {user_id}")
 
     # Disconnect voice
     try:
         await sink.vc.disconnect(force=True)
-    except Exception:
-        pass
+        logger.info(f"Disconnected from voice channel for guild {guild_id}")
+    except Exception as e:
+        logger.error(f"Failed to disconnect from voice: {e}")
 
     # Clear session mapping
     try:
         del sessions[guild_id]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to clear session mapping: {e}")
 
     if channel is None:
         # Fallback: inform owner if post channel missing
+        logger.error(f"POST_CHANNEL_ID {post_channel_id} is invalid or bot lacks access")
         app_info = await bot.application_info()
         try:
             await app_info.owner.send(f"Captured audio for session `{sid}`, but POST_CHANNEL_ID was invalid.")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Could not notify owner: {e}")
         return
 
     await channel.send(f"✅ Audio captured for session `{sid}`. Transcribing…")
+    logger.info(f"Starting transcription for session {sid}")
 
     # Call transcriber API
     async with aiohttp.ClientSession() as http:
         try:
             async with http.post(f"{TRANSCRIBER_URL}/transcribe", json={"session_id": sid}) as resp:
                 if resp.status != 200:
+                    error_msg = f"Transcriber returned status {resp.status}"
+                    logger.error(error_msg)
                     return await channel.send(f"❌ Transcriber error: {resp.status}")
                 result = await resp.json()
+                logger.info(f"Transcription completed for session {sid}")
         except Exception as e:
+            logger.error(f"Failed to reach transcriber at {TRANSCRIBER_URL}: {e}")
             return await channel.send(f"❌ Could not reach transcriber at {TRANSCRIBER_URL}: {e}")
 
     transcript_text = result.get("transcript_text", "")
     try:
-        with open("/app/prompts/recap_prompt.txt", "r") as pf:
+        with open("/app/prompts/recap_prompts.txt", "r") as pf:
             recap_prompt = pf.read().strip()
-    except Exception:
+        logger.debug("Loaded custom recap prompt")
+    except Exception as e:
+        logger.warning(f"Could not load recap prompt file, using fallback: {e}")
         recap_prompt = "Summarize this game session."
 
     await channel.send("🧠 Generating summary…")
+    logger.info(f"Starting LLM summarization for session {sid}")
 
     # Chunk transcript for the model
     chunks = chunk_text(transcript_text, 12000)
+    logger.debug(f"Split transcript into {len(chunks)} chunks for processing")
     outlines = []
     for i, chunk in enumerate(chunks, 1):
+        logger.debug(f"Processing chunk {i}/{len(chunks)}")
         payload = {
             "model": LLM_MODEL,
             "prompt": (
@@ -420,9 +447,12 @@ async def finished_callback(sink: discord.sinks.Sink, post_channel_id: int, guil
             r = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, stream=True, timeout=120)
             outlines.append(stream_ollama(r))
         except Exception as e:
-            outlines.append(f"[Chunk {i} summarization failed: {e}]")
+            error_msg = f"[Chunk {i} summarization failed: {e}]"
+            logger.error(error_msg)
+            outlines.append(error_msg)
 
     outlines_str = "\n\n".join(outlines)
+    logger.debug("Merging chunk summaries into final recap")
     merge_payload = {
         "model": LLM_MODEL,
         "prompt": (
@@ -436,27 +466,40 @@ async def finished_callback(sink: discord.sinks.Sink, post_channel_id: int, guil
         final = stream_ollama(
             requests.post(f"{OLLAMA_HOST}/api/generate", json=merge_payload, stream=True, timeout=180)
         )
+        logger.info(f"Summary generation completed for session {sid}")
     except Exception as e:
-        final = f"[Merge step failed contacting LLM at {OLLAMA_HOST}: {e}]"
+        error_msg = f"[Merge step failed contacting LLM at {OLLAMA_HOST}: {e}]"
+        logger.error(error_msg)
+        final = error_msg
 
     # Post recap (respect Discord 2000-char limit)
-    for part in split_discord(final, 1900):
+    for i, part in enumerate(split_discord(final, 1900), 1):
         await channel.send(part)
+        logger.debug(f"Posted summary part {i}")
 
     # Attach SRT if present
     srt_path = os.path.join(session_dir, "transcript.srt")
     if os.path.exists(srt_path):
         await channel.send(file=discord.File(srt_path, filename=f"{sid}_transcript.srt"))
+        logger.info(f"Posted SRT transcript for session {sid}")
+    else:
+        logger.warning(f"No SRT file found at {srt_path}")
+    
+    logger.info(f"Session {sid} processing complete")
 
 # ── Bot ready ─────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} — slash commands registered for guild {GUILD_ID}")
+    logger.info(f"Bot logged in as {bot.user} (ID: {bot.user.id})")
+    logger.info(f"Slash commands registered for guild {GUILD_ID}")
+    logger.info(f"Using LLM: {LLM_MODEL} at {OLLAMA_HOST}")
+    logger.info(f"Transcriber endpoint: {TRANSCRIBER_URL}")
     # Try syncing commands to ensure visibility
     try:
         await bot.sync_commands()
-    except Exception:
-        pass
+        logger.debug("Commands synced successfully")
+    except Exception as e:
+        logger.error(f"Failed to sync commands: {e}")
 
 # Always capture VOICE_* events; only print when VOICE_DEBUG=1
 @bot.event
@@ -470,8 +513,10 @@ async def on_socket_response(payload):  # type: ignore[override]
                 meta = _voice_meta.setdefault(int(guild_id), {"endpoint": None, "session_id": None, "ts": 0.0})
                 if t == "VOICE_SERVER_UPDATE":
                     meta["endpoint"] = d.get("endpoint")
+                    logger.debug(f"VOICE_SERVER_UPDATE: endpoint={meta['endpoint']}, guild={guild_id}")
                 if t == "VOICE_STATE_UPDATE":
                     meta["session_id"] = d.get("session_id")
+                    logger.debug(f"VOICE_STATE_UPDATE: session_id={meta['session_id']}, guild={guild_id}")
                 meta["ts"] = time.time()
 
             if os.environ.get("VOICE_DEBUG", "").strip() == "1":
@@ -481,8 +526,8 @@ async def on_socket_response(payload):  # type: ignore[override]
                     print(
                         f"[VOICE_DEBUG] STATE_UPDATE guild_id={d.get('guild_id')} channel_id={d.get('channel_id')} user_id={d.get('user_id')} session_id={d.get('session_id')}"
                     )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Error processing socket response: {e}")
 
 def _resolve_ips(host: str) -> list[str]:
     ips = []

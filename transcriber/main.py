@@ -1,9 +1,4 @@
-from fastapi import FastAPI
+# Import the actual FastAPI app with all endpoints from app.py
+from app import app
 
-app = FastAPI()
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-# existing /transcribe endpoint should already be here…
+# The app is fully configured in app.py with /transcribe, /health, etc.

@@ -73,6 +73,48 @@ def stream_ollama(resp) -> str:
 def chunk_text(t: str, n: int):
     return [t[i:i + n] for i in range(0, len(t), n)]
 
+# Permission helpers
+_PERM_LABELS = {
+    "view_channel": "View Channel",
+    "send_messages": "Send Messages",
+    "attach_files": "Attach Files",
+    "connect": "Connect",
+    "speak": "Speak",
+}
+
+def _missing_perms(channel: discord.abc.GuildChannel, member: discord.Member, needed: list[str]) -> list[str]:
+    try:
+        perms = channel.permissions_for(member)
+    except Exception:
+        return needed[:]  # if we can't compute, assume missing
+    missing = []
+    for name in needed:
+        ok = getattr(perms, name, False)
+        if not ok:
+            missing.append(_PERM_LABELS.get(name, name))
+    return missing
+
+async def _ensure_post_channel_perms(guild: discord.Guild) -> tuple[bool, str | None]:
+    """Check that we can post and attach files in the configured POST_CHANNEL_ID.
+    Returns (ok, error_message_if_any).
+    """
+    ch = bot.get_channel(POST_CHANNEL_ID)
+    if ch is None or not isinstance(ch, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
+        return False, (
+            f"Post channel id {POST_CHANNEL_ID} is not accessible.\n"
+            "Fix: Ensure DISCORD_POST_CHANNEL_ID is a valid channel in this guild and the bot can view it."
+        )
+    me = guild.me  # type: ignore[assignment]
+    missing = _missing_perms(ch, me, ["view_channel", "send_messages", "attach_files"])  # type: ignore[arg-type]
+    if missing:
+        return False, (
+            "I can’t send to the configured post channel. Missing:\n" +
+            " • " + "\n • ".join(missing) +
+            "\nFix: Edit that channel’s Permissions → add the bot (or its role) and Allow these permissions.\n"
+            "Alternatively, choose a different channel and update DISCORD_POST_CHANNEL_ID."
+        )
+    return True, None
+
 # Ensure Opus is loaded (Pycord voice)
 try:
     if not discord.opus.is_loaded():
@@ -123,14 +165,8 @@ async def joinvoice(ctx: discord.ApplicationContext):
     ch = ctx.author.voice.channel
     # Pre-check permissions before attempting to connect
     try:
-        perms = ch.permissions_for(ctx.guild.me)  # type: ignore[attr-defined]
-        missing = []
-        if not perms.view_channel:
-            missing.append("View Channel")
-        if not perms.connect:
-            missing.append("Connect")
-        if not perms.speak:
-            missing.append("Speak")
+        me = ctx.guild.me  # type: ignore[attr-defined]
+        missing = _missing_perms(ch, me, ["view_channel", "connect", "speak"])  # type: ignore[arg-type]
         if missing:
             return await ctx.respond(
                 "I’m missing required voice permissions here:\n" +
@@ -335,6 +371,37 @@ async def invite(ctx: discord.ApplicationContext):
     )
     await ctx.respond(f"Invite URL (owner/admin only):\n{url}", ephemeral=True)
 
+@bot.slash_command(guild_ids=[GUILD_ID], description="Verify bot permissions for voice and posting.")
+async def check_setup(ctx: discord.ApplicationContext):
+    await ctx.defer(ephemeral=True)
+    lines: list[str] = []
+
+    # Voice channel permissions (if user is in voice)
+    if ctx.author.voice and ctx.author.voice.channel:
+        ch = ctx.author.voice.channel
+        try:
+            me = ctx.guild.me  # type: ignore[attr-defined]
+            missing = _missing_perms(ch, me, ["view_channel", "connect", "speak"])  # type: ignore[arg-type]
+            if missing:
+                lines.append("Voice channel perms: MISSING → " + ", ".join(missing))
+                lines.append("Fix: Edit that voice channel’s Permissions → add the bot (or its role) and Allow View/Connect/Speak. If private, explicitly add the bot.")
+            else:
+                lines.append("Voice channel perms: OK")
+        except Exception as e:
+            lines.append(f"Voice channel perms: error checking ({e})")
+    else:
+        lines.append("Voice channel perms: user not in a voice channel (skip)")
+
+    # Post channel permissions
+    ok, err = await _ensure_post_channel_perms(ctx.guild)
+    if ok:
+        lines.append("Post channel perms: OK")
+    else:
+        lines.append("Post channel perms: MISSING →" )
+        lines.append(err or "Unknown error")
+
+    await ctx.send_followup("\n".join(lines), ephemeral=True)
+
 @bot.slash_command(guild_ids=[GUILD_ID], description="End-to-end self test (alias of /health).")
 async def self_test(ctx: discord.ApplicationContext):
     await ctx.defer(ephemeral=True)
@@ -359,14 +426,8 @@ async def startnotes(ctx: discord.ApplicationContext):
     # Permission pre-check
     ch = ctx.author.voice.channel
     try:
-        perms = ch.permissions_for(ctx.guild.me)  # type: ignore[attr-defined]
-        missing = []
-        if not perms.view_channel:
-            missing.append("View Channel")
-        if not perms.connect:
-            missing.append("Connect")
-        if not perms.speak:
-            missing.append("Speak")
+        me = ctx.guild.me  # type: ignore[attr-defined]
+        missing = _missing_perms(ch, me, ["view_channel", "connect", "speak"])  # type: ignore[arg-type]
         if missing:
             return await ctx.respond(
                 "I’m missing required voice permissions here:\n" +
@@ -376,6 +437,11 @@ async def startnotes(ctx: discord.ApplicationContext):
             )
     except Exception:
         pass
+
+    # Also confirm we can post results to the configured post channel
+    ok, err = await _ensure_post_channel_perms(ctx.guild)
+    if not ok:
+        return await ctx.respond(err, ephemeral=True)
 
     # Let the user know we’re working
     await ctx.respond("Connecting to voice…", ephemeral=True)
@@ -449,12 +515,32 @@ async def finished_callback(sink: discord.sinks.Sink, post_channel_id: int, guil
     except Exception as e:
         logger.warning(f"Failed to clear session mapping: {e}")
 
+    # Validate post channel perms before attempting to send
+    missing_reason = None
     if channel is None:
-        # Fallback: inform owner if post channel missing
-        logger.error(f"POST_CHANNEL_ID {post_channel_id} is invalid or bot lacks access")
+        missing_reason = "Channel not found or not accessible."
+    else:
+        try:
+            guild = bot.get_guild(guild_id)
+            if guild and guild.me:
+                missing = _missing_perms(channel, guild.me, ["view_channel", "send_messages", "attach_files"])  # type: ignore[arg-type]
+                if missing:
+                    missing_reason = "Missing permissions: " + ", ".join(missing)
+        except Exception as e:
+            missing_reason = f"Could not evaluate permissions: {e}"
+
+    if missing_reason:
+        logger.error(f"Cannot post recap to channel {post_channel_id}: {missing_reason}")
         app_info = await bot.application_info()
         try:
-            await app_info.owner.send(f"Captured audio for session `{sid}`, but POST_CHANNEL_ID was invalid.")
+            await app_info.owner.send(
+                "I captured audio but could not post the recap.\n"
+                f"Session: `{sid}`\n"
+                f"Post channel: {post_channel_id}\n"
+                f"Reason: {missing_reason}\n\n"
+                "Fix: Edit the target channel’s Permissions → add the bot (or its role) and Allow View Channel, Send Messages, and Attach Files;"
+                " or change DISCORD_POST_CHANNEL_ID to a channel where the bot can post."
+            )
         except Exception as e:
             logger.error(f"Could not notify owner: {e}")
         return

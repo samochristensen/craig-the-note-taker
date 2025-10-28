@@ -84,6 +84,7 @@ Bot Commands (Slash)
 - /voice_status — report voice client state for the guild.
 - /health — combined health (gateway, transcriber, ollama).
   - /self_test — alias of /health with extra details when debug is enabled.
+  - /check_setup — verifies permissions for voice and posting to the configured post channel.
 - Debug-only (set `EXPOSE_DEBUG_COMMANDS=1` or `VOICE_DEBUG=1`):
   - /stun_check — UDP STUN reflection from inside the bot container.
   - /voice_endpoint — shows last voice endpoint, resolves IPs.

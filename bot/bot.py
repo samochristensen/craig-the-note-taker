@@ -207,29 +207,43 @@ async def voice_perms(ctx: discord.ApplicationContext):
     except Exception as e:
         await ctx.respond(f"Could not compute perms: {e}", ephemeral=True)
 
-@bot.slash_command(guild_ids=[GUILD_ID], description="Check transcriber health endpoint.")
-async def transcriber_health(ctx: discord.ApplicationContext):
-    await ctx.defer(ephemeral=True)
-    url = f"{TRANSCRIBER_URL}/health"
+async def _collect_health(include_stun: bool = False) -> list[str]:
+    """Collect service health summaries."""
+    results: list[str] = []
+    gw_ms = int((bot.latency or 0) * 1000)
+    results.append(f"Gateway latency: {gw_ms} ms")
+    # Transcriber
     try:
         async with aiohttp.ClientSession() as http:
-            async with http.get(url, timeout=3) as resp:
-                txt = await resp.text()
-                await ctx.send_followup(content=f"Transcriber {resp.status}: {txt[:500]}", ephemeral=True)
+            async with http.get(f"{TRANSCRIBER_URL}/health", timeout=5) as r:
+                ok = r.status == 200
+        results.append(f"Transcriber /health: {'ok' if ok else 'bad'} ({r.status})")
     except Exception as e:
-        await ctx.send_followup(content=f"Transcriber error: {e}", ephemeral=True)
+        results.append(f"Transcriber error: {e}")
+    # Ollama
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.get(f"{OLLAMA_HOST}/api/tags", timeout=5) as r:
+                tags = await r.json()
+                models = [m.get('model') for m in tags.get('models', [])]
+        results.append(f"Ollama models: {len(models)}")
+    except Exception as e:
+        results.append(f"Ollama error: {e}")
+    # Optional STUN
+    if include_stun:
+        try:
+            bytes_len = await asyncio.to_thread(_stun_probe_once)
+            results.append(f"STUN: {'ok' if bytes_len else 'no response'}")
+        except Exception as e:
+            results.append(f"STUN error: {e}")
+    return results
 
-@bot.slash_command(guild_ids=[GUILD_ID], description="Check Ollama tags endpoint.")
-async def ollama_health(ctx: discord.ApplicationContext):
+@bot.slash_command(guild_ids=[GUILD_ID], description="Combined health: gateway, transcriber, ollama.")
+async def health(ctx: discord.ApplicationContext):
     await ctx.defer(ephemeral=True)
-    try:
-        async with aiohttp.ClientSession() as http:
-            async with http.get(f"{OLLAMA_HOST}/api/tags", timeout=5) as resp:
-                data = await resp.json()
-                models = [m.get('model') for m in data.get('models', [])]
-                await ctx.send_followup(content=f"Ollama OK: {len(models)} models: {', '.join(models)[:500]}", ephemeral=True)
-    except Exception as e:
-        await ctx.send_followup(content=f"Ollama error: {e}", ephemeral=True)
+    include_stun = os.environ.get("EXPOSE_DEBUG_COMMANDS", "0").strip() == "1" or os.environ.get("VOICE_DEBUG", "").strip() == "1"
+    results = await _collect_health(include_stun=include_stun)
+    await ctx.send_followup("\n".join(results), ephemeral=True)
 
 def _stun_probe_once(host='stun.l.google.com', port=19302, timeout=2):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -261,14 +275,16 @@ def _voice_diag_summary(guild_id: int) -> str:
         return "no VOICE_* events captured"
     return ", ".join(parts)
 
-@bot.slash_command(guild_ids=[GUILD_ID], description="UDP STUN reflection check from the bot container.")
-async def stun_check(ctx: discord.ApplicationContext):
-    await ctx.defer(ephemeral=True)
-    bytes_len = await asyncio.to_thread(_stun_probe_once)
-    if bytes_len:
-        await ctx.send_followup(content=f"STUN OK ({bytes_len} bytes)", ephemeral=True)
-    else:
-        await ctx.send_followup(content="STUN failed (no UDP response)", ephemeral=True)
+EXPOSE_DEBUG_CMDS = os.environ.get("EXPOSE_DEBUG_COMMANDS", "0").strip() == "1" or os.environ.get("VOICE_DEBUG", "").strip() == "1"
+if EXPOSE_DEBUG_CMDS:
+    @bot.slash_command(guild_ids=[GUILD_ID], description="UDP STUN reflection check from the bot container.")
+    async def stun_check(ctx: discord.ApplicationContext):
+        await ctx.defer(ephemeral=True)
+        bytes_len = await asyncio.to_thread(_stun_probe_once)
+        if bytes_len:
+            await ctx.send_followup(content=f"STUN OK ({bytes_len} bytes)", ephemeral=True)
+        else:
+            await ctx.send_followup(content="STUN failed (no UDP response)", ephemeral=True)
 
 @bot.slash_command(guild_ids=[GUILD_ID], description="Force re-sync of application commands.")
 async def sync(ctx: discord.ApplicationContext):
@@ -291,15 +307,16 @@ async def whoami(ctx: discord.ApplicationContext):
         ephemeral=True,
     )
 
-@bot.slash_command(guild_ids=[GUILD_ID], description="Show gateway intents and voice debug state.")
-async def intents(ctx: discord.ApplicationContext):
-    i = bot.intents
-    await ctx.respond(
-        "Intents:"\
-        f" voice_states={i.voice_states} guilds={i.guilds}\n"\
-        f"VOICE_DEBUG={os.environ.get('VOICE_DEBUG', '')}",
-        ephemeral=True,
-    )
+if EXPOSE_DEBUG_CMDS:
+    @bot.slash_command(guild_ids=[GUILD_ID], description="Show gateway intents and voice debug state.")
+    async def intents(ctx: discord.ApplicationContext):
+        i = bot.intents
+        await ctx.respond(
+            "Intents:"\
+            f" voice_states={i.voice_states} guilds={i.guilds}\n"\
+            f"VOICE_DEBUG={os.environ.get('VOICE_DEBUG', '')}",
+            ephemeral=True,
+        )
 
 @bot.slash_command(guild_ids=[GUILD_ID], description="Show OAuth2 invite URL for this bot.")
 async def invite(ctx: discord.ApplicationContext):
@@ -318,41 +335,16 @@ async def invite(ctx: discord.ApplicationContext):
     )
     await ctx.respond(f"Invite URL (owner/admin only):\n{url}", ephemeral=True)
 
-@bot.slash_command(guild_ids=[GUILD_ID], description="Run a quick end-to-end self test.")
+@bot.slash_command(guild_ids=[GUILD_ID], description="End-to-end self test (alias of /health).")
 async def self_test(ctx: discord.ApplicationContext):
     await ctx.defer(ephemeral=True)
-    results = []
-    gw_ms = int((bot.latency or 0) * 1000)
-    results.append(f"Gateway latency: {gw_ms} ms")
+    include_stun = os.environ.get("EXPOSE_DEBUG_COMMANDS", "0").strip() == "1" or os.environ.get("VOICE_DEBUG", "").strip() == "1"
+    results = await _collect_health(include_stun=include_stun)
     try:
         perms = ctx.channel.permissions_for(ctx.guild.me)  # type: ignore[attr-defined]
-        results.append(f"Send perms here: {'yes' if perms.send_messages else 'no'}")
+        results.insert(1, f"Send perms here: {'yes' if perms.send_messages else 'no'}")
     except Exception:
-        results.append("Send perms here: unknown")
-    # Transcriber health
-    try:
-        async with aiohttp.ClientSession() as http:
-            async with http.get(f"{TRANSCRIBER_URL}/health", timeout=5) as r:
-                ok = r.status == 200
-        results.append(f"Transcriber /health: {'ok' if ok else 'bad'} ({r.status})")
-    except Exception as e:
-        results.append(f"Transcriber error: {e}")
-    # Ollama tags
-    try:
-        async with aiohttp.ClientSession() as http:
-            async with http.get(f"{OLLAMA_HOST}/api/tags", timeout=5) as r:
-                tags = await r.json()
-                models = [m.get('model') for m in tags.get('models', [])]
-        results.append(f"Ollama models: {len(models)}")
-    except Exception as e:
-        results.append(f"Ollama error: {e}")
-    # STUN
-    try:
-        bytes_len = await asyncio.to_thread(_stun_probe_once)
-        results.append(f"STUN: {'ok' if bytes_len else 'no response'}")
-    except Exception as e:
-        results.append(f"STUN error: {e}")
-
+        pass
     await ctx.send_followup("\n".join(results), ephemeral=True)
 
 @bot.slash_command(guild_ids=[GUILD_ID], description="Join your voice channel and start recording.")
@@ -626,18 +618,19 @@ def _resolve_ips(host: str) -> list[str]:
         pass
     return ips
 
-@bot.slash_command(guild_ids=[GUILD_ID], description="Show last voice endpoint and resolved IPs for this guild.")
-async def voice_endpoint(ctx: discord.ApplicationContext):
-    meta = _voice_meta.get(ctx.guild.id)
-    if not meta or not meta.get("endpoint"):
-        return await ctx.respond("No endpoint captured yet. Try /joinvoice to trigger VOICE_SERVER_UPDATE.", ephemeral=True)
-    endpoint = str(meta["endpoint"])  # e.g., region.discord.media:443
-    host = endpoint.split(":", 1)[0]
-    ips = await asyncio.to_thread(_resolve_ips, host)
-    await ctx.respond(
-        f"Endpoint: {endpoint}\nHost: {host}\nIPs: {', '.join(ips) if ips else '(none)'}",
-        ephemeral=True,
-    )
+if EXPOSE_DEBUG_CMDS:
+    @bot.slash_command(guild_ids=[GUILD_ID], description="Show last voice endpoint and resolved IPs for this guild.")
+    async def voice_endpoint(ctx: discord.ApplicationContext):
+        meta = _voice_meta.get(ctx.guild.id)
+        if not meta or not meta.get("endpoint"):
+            return await ctx.respond("No endpoint captured yet. Try /joinvoice to trigger VOICE_SERVER_UPDATE.", ephemeral=True)
+        endpoint = str(meta["endpoint"])  # e.g., region.discord.media:443
+        host = endpoint.split(":", 1)[0]
+        ips = await asyncio.to_thread(_resolve_ips, host)
+        await ctx.respond(
+            f"Endpoint: {endpoint}\nHost: {host}\nIPs: {', '.join(ips) if ips else '(none)'}",
+            ephemeral=True,
+        )
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 bot.run(TOKEN)

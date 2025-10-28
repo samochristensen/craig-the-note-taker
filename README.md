@@ -5,7 +5,7 @@ Overview
 - Everything runs locally via Docker Compose. No external SaaS.
 
 Services
-- discord-bot: Py‑Cord 2.5, joins voice, records per‑user WAVs to disk, calls transcriber, prompts Ollama, posts recap.
+- discord-bot: Py‑Cord 2.6, joins voice, records per‑user WAVs to disk, calls transcriber, prompts Ollama, posts recap.
 - transcriber: FastAPI + WhisperX. Consumes saved WAVs, outputs SRT + transcript text.
 - ollama: Local LLM server. Default model: llama3.1:8b (pull separately).
 
@@ -57,8 +57,7 @@ Setup and First Run
    - Confirm slash commands present in your server(s) (guild‑scoped are instant; global may take up to ~1 hour).
    - Run /hello and /ping.
    - If slash commands don’t appear: ensure the bot was invited with applications.commands scope. Use /invite to get the URL. You can also run /sync to force a re-sync for the current guild.
-   - Run /ollama_health (models should include llama3.1:8b).
-   - Run /transcriber_health (expect status 200 JSON).
+   - Run /health (gateway + transcriber + ollama). Models should include llama3.1:8b; transcriber /health should be 200.
    - In a voice channel: /joinvoice → /startnotes → speak 20–30s → /stopnotes
    - Expect recap messages and transcript.srt in your post channel.
 
@@ -83,10 +82,12 @@ Bot Commands (Slash)
 - /joinvoice — connect to your voice channel (no recording).
 - /leavevoice — disconnect from voice.
 - /voice_status — report voice client state for the guild.
-- /transcriber_health — GET /health from the transcriber.
-- /ollama_health — list models from Ollama /api/tags.
-- /stun_check — UDP STUN reflection from inside the bot container.
- - /voice_endpoint — shows last voice endpoint, resolves IPs.
+- /health — combined health (gateway, transcriber, ollama).
+  - /self_test — alias of /health with extra details when debug is enabled.
+- Debug-only (set `EXPOSE_DEBUG_COMMANDS=1` or `VOICE_DEBUG=1`):
+  - /stun_check — UDP STUN reflection from inside the bot container.
+  - /voice_endpoint — shows last voice endpoint, resolves IPs.
+  - /intents — shows gateway intents and VOICE_DEBUG.
  - /sync — force re-sync of application commands.
  - /whoami — prints bot identity and config highlights.
  - /invite — prints OAuth2 invite URL.

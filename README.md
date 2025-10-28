@@ -56,6 +56,7 @@ Setup and First Run
 6) In‑Discord tests
    - Confirm slash commands present in your server(s) (guild‑scoped are instant; global may take up to ~1 hour).
    - Run /hello and /ping.
+   - If slash commands don’t appear: ensure the bot was invited with applications.commands scope. Use /invite to get the URL. You can also run /sync to force a re-sync for the current guild.
    - Run /ollama_health (models should include llama3.1:8b).
    - Run /transcriber_health (expect status 200 JSON).
    - In a voice channel: /joinvoice → /startnotes → speak 20–30s → /stopnotes
@@ -64,6 +65,15 @@ Setup and First Run
 Diagnostics
 - Run the built‑in checks: ./diag_discord_notetaker.sh
 - It verifies env, container status, opus load, HTTP reachability, UDP smoke, and optional STUN.
+
+Voice Diagnostics (host + container)
+- Run: ./diag_voice_connect.sh
+- What it does:
+  - Confirms bot container and host networking
+  - DNS/HTTPS reachability to discord.com
+  - UDP smoketest + STUN reflection (host and inside bot)
+  - IPv6 posture, Tailscale hints, and firewall snippets
+  - Prints suggested next steps and tcpdump filter to use during /joinvoice
 
 Bot Commands (Slash)
 - /startnotes — join your current voice channel and start recording.
@@ -76,6 +86,11 @@ Bot Commands (Slash)
 - /transcriber_health — GET /health from the transcriber.
 - /ollama_health — list models from Ollama /api/tags.
 - /stun_check — UDP STUN reflection from inside the bot container.
+ - /voice_endpoint — shows last voice endpoint, resolves IPs.
+ - /sync — force re-sync of application commands.
+ - /whoami — prints bot identity and config highlights.
+ - /invite — prints OAuth2 invite URL.
+ - /self_test — runs quick end-to-end validation.
 
 Troubleshooting Voice Connection
 Symptom: “Voice connect timed out.” The bot times out during the voice handshake.
@@ -114,4 +129,3 @@ Repository Structure
 
 License
 - Local/private use. No license headers added by default.
-

@@ -1,4 +1,4 @@
-import os, io, json, time, asyncio, aiohttp, requests
+import os, io, json, time, asyncio, aiohttp, requests, logging, socket, struct
 import discord
 from discord.ext import commands
 
@@ -19,6 +19,9 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
 # guild_id -> {"vc": VoiceClient, "session_id": str}
 sessions = {}
+
+# Track last seen voice endpoint/session per guild to aid diagnostics.
+_voice_meta = {}  # guild_id -> {"endpoint": str | None, "session_id": str | None, "ts": float}
 
 # ── Utils ──────────────────────────────────────────────────────────────────────
 def new_session_id() -> str:
@@ -72,6 +75,230 @@ async def _reply(ctx: discord.ApplicationContext, content: str, ephemeral: bool 
     else:
         return await ctx.send_followup(content, ephemeral=ephemeral)
 
+@bot.slash_command(guild_ids=[GUILD_ID], description="Hello test to verify bot responds.")
+async def hello(ctx: discord.ApplicationContext):
+    await ctx.respond(
+        "Hello! The bot is alive.\n"
+        f"Guild: {ctx.guild.id}\n"
+        f"Py-Cord: {discord.__version__}",
+        ephemeral=True,
+    )
+
+@bot.slash_command(guild_ids=[GUILD_ID], description="Gateway ping and basic info.")
+async def ping(ctx: discord.ApplicationContext):
+    t0 = time.perf_counter()
+    await ctx.respond("Pinging…", ephemeral=True)
+    t1 = time.perf_counter()
+    gw_ms = int((bot.latency or 0) * 1000)
+    await ctx.send_followup(
+        content=(
+            f"Pong!\nGateway latency: {gw_ms} ms\n"
+            f"Ack RTT: {int((t1 - t0)*1000)} ms"
+        ),
+        ephemeral=True,
+    )
+
+@bot.slash_command(guild_ids=[GUILD_ID], description="Join your current voice channel without recording.")
+async def joinvoice(ctx: discord.ApplicationContext):
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return await ctx.respond("Join a voice channel first.", ephemeral=True)
+    await ctx.respond("Connecting to voice…", ephemeral=True)
+    try:
+        vc = await ctx.author.voice.channel.connect(timeout=45.0, reconnect=True)
+    except asyncio.TimeoutError:
+        diag = _voice_diag_summary(ctx.guild.id)
+        hint = (
+            "⏱️ Voice connect timed out.\n"
+            f"Last VOICE events: {diag}\n"
+            "Tips: set a specific channel region (not Auto); ensure outbound UDP; if on Tailscale, test netfilter off; try IPv6-off test."
+        )
+        return await _reply(ctx, hint, ephemeral=True)
+    except discord.Forbidden:
+        return await _reply(ctx, "❌ Missing permission to join or speak in that channel.", ephemeral=True)
+    except discord.HTTPException as e:
+        return await _reply(ctx, f"❌ HTTP error while joining voice: {e.status}", ephemeral=True)
+    except discord.ClientException as e:
+        return await _reply(ctx, f"❌ Client error: {e}", ephemeral=True)
+    except Exception as e:
+        return await _reply(ctx, f"❌ Could not join voice: `{type(e).__name__}`", ephemeral=True)
+    await _reply(ctx, f"✅ Connected to {ctx.author.voice.channel.name}.", ephemeral=True)
+
+@bot.slash_command(guild_ids=[GUILD_ID], description="Leave the current voice channel.")
+async def leavevoice(ctx: discord.ApplicationContext):
+    await ctx.defer(ephemeral=True)
+    vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+    if vc and vc.is_connected():
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+        await ctx.send_followup(content="👋 Disconnected from voice.", ephemeral=True)
+    else:
+        await ctx.send_followup(content="Not connected to voice.", ephemeral=True)
+
+@bot.slash_command(guild_ids=[GUILD_ID], description="Report voice connection status for this guild.")
+async def voice_status(ctx: discord.ApplicationContext):
+    vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+    if not vc:
+        return await ctx.respond("No voice client for this guild.", ephemeral=True)
+    details = {
+        "is_connected": vc.is_connected(),
+        "channel": getattr(vc.channel, 'name', None),
+        "guild_id": vc.guild.id,
+        "latency_ms": int((vc.latency or 0) * 1000) if hasattr(vc, 'latency') else None,
+    }
+    await ctx.respond(f"Voice status: {details}", ephemeral=True)
+
+@bot.slash_command(guild_ids=[GUILD_ID], description="Show the bot's permissions in your current voice channel.")
+async def voice_perms(ctx: discord.ApplicationContext):
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return await ctx.respond("Join a voice channel first.", ephemeral=True)
+    ch = ctx.author.voice.channel
+    try:
+        perms = ch.permissions_for(ctx.guild.me)  # type: ignore[attr-defined]
+        await ctx.respond(
+            "Permissions in this voice channel:\n"
+            f"• View Channel: {'yes' if perms.view_channel else 'no'}\n"
+            f"• Connect: {'yes' if perms.connect else 'no'}\n"
+            f"• Speak: {'yes' if perms.speak else 'no'}\n"
+            f"• Mute Members: {'yes' if perms.mute_members else 'no'}\n"
+            f"• Move Members: {'yes' if perms.move_members else 'no'}",
+            ephemeral=True,
+        )
+    except Exception as e:
+        await ctx.respond(f"Could not compute perms: {e}", ephemeral=True)
+
+@bot.slash_command(guild_ids=[GUILD_ID], description="Check transcriber health endpoint.")
+async def transcriber_health(ctx: discord.ApplicationContext):
+    await ctx.defer(ephemeral=True)
+    url = f"{TRANSCRIBER_URL}/health"
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.get(url, timeout=3) as resp:
+                txt = await resp.text()
+                await ctx.send_followup(content=f"Transcriber {resp.status}: {txt[:500]}", ephemeral=True)
+    except Exception as e:
+        await ctx.send_followup(content=f"Transcriber error: {e}", ephemeral=True)
+
+@bot.slash_command(guild_ids=[GUILD_ID], description="Check Ollama tags endpoint.")
+async def ollama_health(ctx: discord.ApplicationContext):
+    await ctx.defer(ephemeral=True)
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.get(f"{OLLAMA_HOST}/api/tags", timeout=5) as resp:
+                data = await resp.json()
+                models = [m.get('model') for m in data.get('models', [])]
+                await ctx.send_followup(content=f"Ollama OK: {len(models)} models: {', '.join(models)[:500]}", ephemeral=True)
+    except Exception as e:
+        await ctx.send_followup(content=f"Ollama error: {e}", ephemeral=True)
+
+def _stun_probe_once(host='stun.l.google.com', port=19302, timeout=2):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    tid = os.urandom(12)
+    msg = struct.pack('!HHI12s', 0x0001, 0, 0x2112A442, tid)
+    s.sendto(msg, (host, port))
+    try:
+        data, _ = s.recvfrom(2048)
+        return len(data)
+    except Exception:
+        return 0
+
+def _voice_diag_summary(guild_id: int) -> str:
+    """Summarize last captured VOICE_* events for diagnostics."""
+    meta = _voice_meta.get(guild_id, {})
+    endpoint = meta.get("endpoint")
+    session_id = meta.get("session_id")
+    ts = meta.get("ts", 0.0)
+    age = int(time.time() - ts) if ts else None
+    parts = []
+    if endpoint:
+        parts.append(f"endpoint={endpoint}")
+    if session_id:
+        parts.append("have_session_id=1")
+    if age is not None:
+        parts.append(f"age_s={age}")
+    if not parts:
+        return "no VOICE_* events captured"
+    return ", ".join(parts)
+
+@bot.slash_command(guild_ids=[GUILD_ID], description="UDP STUN reflection check from the bot container.")
+async def stun_check(ctx: discord.ApplicationContext):
+    await ctx.defer(ephemeral=True)
+    bytes_len = await asyncio.to_thread(_stun_probe_once)
+    if bytes_len:
+        await ctx.send_followup(content=f"STUN OK ({bytes_len} bytes)", ephemeral=True)
+    else:
+        await ctx.send_followup(content="STUN failed (no UDP response)", ephemeral=True)
+
+@bot.slash_command(guild_ids=[GUILD_ID], description="Force re-sync of application commands.")
+async def sync(ctx: discord.ApplicationContext):
+    await ctx.defer(ephemeral=True)
+    try:
+        await bot.sync_commands()
+        await ctx.send_followup("✅ Commands synced. If commands are global, allow up to ~1 hour to propagate.", ephemeral=True)
+    except Exception as e:
+        await ctx.send_followup(f"❌ Sync failed: {e}", ephemeral=True)
+
+@bot.slash_command(guild_ids=[GUILD_ID], description="Show bot identity and current config highlights.")
+async def whoami(ctx: discord.ApplicationContext):
+    app_info = await bot.application_info()
+    await ctx.respond(
+        f"User: {bot.user} (id={bot.user.id})\n"
+        f"App ID: {app_info.id}\n"
+        f"Guild scope: {GUILD_ID}\n"
+        f"LLM: {LLM_MODEL}\n"
+        f"Transcriber: {TRANSCRIBER_URL}",
+        ephemeral=True,
+    )
+
+@bot.slash_command(guild_ids=[GUILD_ID], description="Show OAuth2 invite URL for this bot.")
+async def invite(ctx: discord.ApplicationContext):
+    app_info = await bot.application_info()
+    perms = 0
+    url = (
+        f"https://discord.com/api/oauth2/authorize?client_id={app_info.id}"
+        f"&permissions={perms}&scope=bot%20applications.commands"
+    )
+    await ctx.respond(f"Invite URL (owner/admin only):\n{url}", ephemeral=True)
+
+@bot.slash_command(guild_ids=[GUILD_ID], description="Run a quick end-to-end self test.")
+async def self_test(ctx: discord.ApplicationContext):
+    await ctx.defer(ephemeral=True)
+    results = []
+    gw_ms = int((bot.latency or 0) * 1000)
+    results.append(f"Gateway latency: {gw_ms} ms")
+    try:
+        perms = ctx.channel.permissions_for(ctx.guild.me)  # type: ignore[attr-defined]
+        results.append(f"Send perms here: {'yes' if perms.send_messages else 'no'}")
+    except Exception:
+        results.append("Send perms here: unknown")
+    # Transcriber health
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.get(f"{TRANSCRIBER_URL}/health", timeout=5) as r:
+                ok = r.status == 200
+        results.append(f"Transcriber /health: {'ok' if ok else 'bad'} ({r.status})")
+    except Exception as e:
+        results.append(f"Transcriber error: {e}")
+    # Ollama tags
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.get(f"{OLLAMA_HOST}/api/tags", timeout=5) as r:
+                tags = await r.json()
+                models = [m.get('model') for m in tags.get('models', [])]
+        results.append(f"Ollama models: {len(models)}")
+    except Exception as e:
+        results.append(f"Ollama error: {e}")
+    # STUN
+    try:
+        bytes_len = await asyncio.to_thread(_stun_probe_once)
+        results.append(f"STUN: {'ok' if bytes_len else 'no response'}")
+    except Exception as e:
+        results.append(f"STUN error: {e}")
+
+    await ctx.send_followup("\n".join(results), ephemeral=True)
+
 @bot.slash_command(guild_ids=[GUILD_ID], description="Join your voice channel and start recording.")
 async def startnotes(ctx: discord.ApplicationContext):
     if not ctx.author.voice or not ctx.author.voice.channel:
@@ -85,13 +312,14 @@ async def startnotes(ctx: discord.ApplicationContext):
     await ctx.respond("Connecting to voice…", ephemeral=True)
 
     try:
-        vc = await ctx.author.voice.channel.connect(timeout=30.0, reconnect=True)
+        vc = await ctx.author.voice.channel.connect(timeout=60.0, reconnect=True)
     except asyncio.TimeoutError:
+        diag = _voice_diag_summary(ctx.guild.id)
         return await _reply(
             ctx,
             "⏱️ Voice connect timed out.\n"
-            "• Try again in a few seconds.\n"
-            "• If it persists, run the bot with `network_mode: host` and ensure outbound UDP isn’t blocked.",
+            f"Last VOICE events: {diag}\n"
+            "Tips: set a specific channel region (not Auto); ensure outbound UDP; if on Tailscale, test netfilter off; try IPv6-off test.",
             ephemeral=True,
         )
     except Exception as e:
@@ -224,6 +452,66 @@ async def finished_callback(sink: discord.sinks.Sink, post_channel_id: int, guil
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} — slash commands registered for guild {GUILD_ID}")
+    # Try syncing commands to ensure visibility
+    try:
+        await bot.sync_commands()
+    except Exception:
+        pass
+
+# Always capture VOICE_* events; only print when VOICE_DEBUG=1
+@bot.event
+async def on_socket_response(payload):  # type: ignore[override]
+    try:
+        t = payload.get("t")
+        if t in ("VOICE_SERVER_UPDATE", "VOICE_STATE_UPDATE"):
+            d = payload.get("d", {})
+            guild_id = d.get("guild_id")
+            if guild_id:
+                meta = _voice_meta.setdefault(int(guild_id), {"endpoint": None, "session_id": None, "ts": 0.0})
+                if t == "VOICE_SERVER_UPDATE":
+                    meta["endpoint"] = d.get("endpoint")
+                if t == "VOICE_STATE_UPDATE":
+                    meta["session_id"] = d.get("session_id")
+                meta["ts"] = time.time()
+
+            if os.environ.get("VOICE_DEBUG", "").strip() == "1":
+                if t == "VOICE_SERVER_UPDATE":
+                    print(f"[VOICE_DEBUG] SERVER_UPDATE endpoint={d.get('endpoint')} guild_id={d.get('guild_id')}")
+                if t == "VOICE_STATE_UPDATE":
+                    print(
+                        f"[VOICE_DEBUG] STATE_UPDATE guild_id={d.get('guild_id')} channel_id={d.get('channel_id')} user_id={d.get('user_id')} session_id={d.get('session_id')}"
+                    )
+    except Exception:
+        pass
+
+def _resolve_ips(host: str) -> list[str]:
+    ips = []
+    try:
+        for family in (socket.AF_INET, socket.AF_INET6):
+            try:
+                ai = socket.getaddrinfo(host, None, family, socket.SOCK_DGRAM)
+            except Exception:
+                continue
+            for entry in ai:
+                addr = entry[4][0]
+                if addr not in ips:
+                    ips.append(addr)
+    except Exception:
+        pass
+    return ips
+
+@bot.slash_command(guild_ids=[GUILD_ID], description="Show last voice endpoint and resolved IPs for this guild.")
+async def voice_endpoint(ctx: discord.ApplicationContext):
+    meta = _voice_meta.get(ctx.guild.id)
+    if not meta or not meta.get("endpoint"):
+        return await ctx.respond("No endpoint captured yet. Try /joinvoice to trigger VOICE_SERVER_UPDATE.", ephemeral=True)
+    endpoint = str(meta["endpoint"])  # e.g., region.discord.media:443
+    host = endpoint.split(":", 1)[0]
+    ips = await asyncio.to_thread(_resolve_ips, host)
+    await ctx.respond(
+        f"Endpoint: {endpoint}\nHost: {host}\nIPs: {', '.join(ips) if ips else '(none)'}",
+        ephemeral=True,
+    )
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 bot.run(TOKEN)

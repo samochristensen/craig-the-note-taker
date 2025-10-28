@@ -11,6 +11,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("discord_bot")
 
+# Optional: turn up internal discord.py/py-cord voice/gateway logs when VOICE_DEBUG=1
+if os.environ.get("VOICE_DEBUG", "").strip() == "1":
+    for name in ("discord", "discord.voice_client", "discord.gateway", "discord.state", "discord.http"):
+        try:
+            logging.getLogger(name).setLevel(logging.DEBUG)
+        except Exception:
+            pass
+
 # ── Env ─────────────────────────────────────────────────────────────────────────
 TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GUILD_ID = int(os.environ["DISCORD_GUILD_ID"])
@@ -112,6 +120,27 @@ async def ping(ctx: discord.ApplicationContext):
 async def joinvoice(ctx: discord.ApplicationContext):
     if not ctx.author.voice or not ctx.author.voice.channel:
         return await ctx.respond("Join a voice channel first.", ephemeral=True)
+    ch = ctx.author.voice.channel
+    # Pre-check permissions before attempting to connect
+    try:
+        perms = ch.permissions_for(ctx.guild.me)  # type: ignore[attr-defined]
+        missing = []
+        if not perms.view_channel:
+            missing.append("View Channel")
+        if not perms.connect:
+            missing.append("Connect")
+        if not perms.speak:
+            missing.append("Speak")
+        if missing:
+            return await ctx.respond(
+                "I’m missing required voice permissions here:\n" +
+                " • " + "\n • ".join(missing) +
+                "\nFix: Edit Channel → Permissions → add the bot (or its role) and Allow View/Connect/Speak.",
+                ephemeral=True,
+            )
+    except Exception:
+        pass
+
     await ctx.respond("Connecting to voice…", ephemeral=True)
     try:
         vc = await ctx.author.voice.channel.connect(timeout=45.0, reconnect=True)
@@ -262,13 +291,30 @@ async def whoami(ctx: discord.ApplicationContext):
         ephemeral=True,
     )
 
+@bot.slash_command(guild_ids=[GUILD_ID], description="Show gateway intents and voice debug state.")
+async def intents(ctx: discord.ApplicationContext):
+    i = bot.intents
+    await ctx.respond(
+        "Intents:"\
+        f" voice_states={i.voice_states} guilds={i.guilds}\n"\
+        f"VOICE_DEBUG={os.environ.get('VOICE_DEBUG', '')}",
+        ephemeral=True,
+    )
+
 @bot.slash_command(guild_ids=[GUILD_ID], description="Show OAuth2 invite URL for this bot.")
 async def invite(ctx: discord.ApplicationContext):
     app_info = await bot.application_info()
-    perms = 0
+    # Recommend minimal perms needed for this bot's functions
+    recommended = discord.Permissions(
+        view_channel=True,
+        send_messages=True,
+        attach_files=True,
+        connect=True,
+        speak=True,
+    ).value
     url = (
         f"https://discord.com/api/oauth2/authorize?client_id={app_info.id}"
-        f"&permissions={perms}&scope=bot%20applications.commands"
+        f"&permissions={recommended}&scope=bot%20applications.commands"
     )
     await ctx.respond(f"Invite URL (owner/admin only):\n{url}", ephemeral=True)
 
@@ -317,6 +363,27 @@ async def startnotes(ctx: discord.ApplicationContext):
     guild = ctx.guild
     if guild.id in sessions:
         return await ctx.respond("Already recording in this server.", ephemeral=True)
+
+    # Permission pre-check
+    ch = ctx.author.voice.channel
+    try:
+        perms = ch.permissions_for(ctx.guild.me)  # type: ignore[attr-defined]
+        missing = []
+        if not perms.view_channel:
+            missing.append("View Channel")
+        if not perms.connect:
+            missing.append("Connect")
+        if not perms.speak:
+            missing.append("Speak")
+        if missing:
+            return await ctx.respond(
+                "I’m missing required voice permissions here:\n" +
+                " • " + "\n • ".join(missing) +
+                "\nFix: Edit Channel → Permissions → add the bot (or its role) and Allow View/Connect/Speak.",
+                ephemeral=True,
+            )
+    except Exception:
+        pass
 
     # Let the user know we’re working
     await ctx.respond("Connecting to voice…", ephemeral=True)
@@ -528,6 +595,20 @@ async def on_socket_response(payload):  # type: ignore[override]
                     )
     except Exception as e:
         logger.error(f"Error processing socket response: {e}")
+
+
+# Extra visibility: high-level voice state transitions (fires if VOICE_STATE_UPDATE is delivered)
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    try:
+        if os.environ.get("VOICE_DEBUG", "").strip() == "1" and bot.user and member.id == bot.user.id:
+            bch = getattr(before.channel, 'id', None)
+            ach = getattr(after.channel, 'id', None)
+            logger.debug(
+                f"on_voice_state_update(self): guild={member.guild.id} before_ch={bch} after_ch={ach}"
+            )
+    except Exception:
+        pass
 
 def _resolve_ips(host: str) -> list[str]:
     ips = []

@@ -65,6 +65,11 @@ Diagnostics
 - Run the built‑in checks: ./diag_discord_notetaker.sh
 - It verifies env, container status, opus load, HTTP reachability, UDP smoke, and optional STUN.
 
+Voice Flap Monitor
+- ./voice_monitor.sh              # tails bot logs and detects 4006 cycles
+- sudo ./voice_monitor.sh cap     # additionally captures 45s tcpdump when 3+ flaps occur
+- The bot persists last voice endpoint/session at data/voice_last.json for the monitor and TLS probe.
+
 Voice Diagnostics (host + container)
 - Run: ./diag_voice_connect.sh
 - What it does:
@@ -85,6 +90,7 @@ Bot Commands (Slash)
 - /health — combined health (gateway, transcriber, ollama).
   - /self_test — alias of /health with extra details when debug is enabled.
   - /check_setup — verifies permissions for voice and posting to the configured post channel.
+  - Auto‑reconnect: when joined (or during /startnotes), the bot now keeps a small watchdog that reconnects if the voice WS drops (e.g., 4006), with bounded backoff.
 - Debug-only (set `EXPOSE_DEBUG_COMMANDS=1` or `VOICE_DEBUG=1`):
   - /stun_check — UDP STUN reflection from inside the bot container.
   - /voice_endpoint — shows last voice endpoint, resolves IPs.

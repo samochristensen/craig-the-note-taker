@@ -37,6 +37,11 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 # guild_id -> {"vc": VoiceClient, "session_id": str}
 sessions = {}
 
+# Watchdog state per guild for persistent auto-reconnect
+_watchdog_flags: dict[int, bool] = {}
+_watchdog_tasks: dict[int, asyncio.Task] = {}
+_watchdog_connecting: set[int] = set()
+
 # Track last seen voice endpoint/session per guild to aid diagnostics.
 _voice_meta = {}  # guild_id -> {"endpoint": str | None, "session_id": str | None, "ts": float}
 
@@ -179,7 +184,8 @@ async def joinvoice(ctx: discord.ApplicationContext):
 
     await ctx.respond("Connecting to voice…", ephemeral=True)
     try:
-        vc = await ctx.author.voice.channel.connect(timeout=45.0, reconnect=True)
+        # attempts=0 → retry indefinitely until max_total_time is reached
+        vc, retried = await _connect_voice_with_retry(ch, attempts=0, timeout=45.0, max_total_time=180.0)
     except asyncio.TimeoutError:
         diag = _voice_diag_summary(ctx.guild.id)
         hint = (
@@ -196,7 +202,20 @@ async def joinvoice(ctx: discord.ApplicationContext):
         return await _reply(ctx, f"❌ Client error: {e}", ephemeral=True)
     except Exception as e:
         return await _reply(ctx, f"❌ Could not join voice: `{type(e).__name__}`", ephemeral=True)
-    await _reply(ctx, f"✅ Connected to {ctx.author.voice.channel.name}.", ephemeral=True)
+    if not vc:
+        return await _reply(
+            ctx,
+            "Connected, but the voice session looks unstable even after one retry.\n"
+            "Try switching the voice region; if it persists, toggle IPv6 or test without VPN.",
+            ephemeral=True,
+        )
+    suffix = " (after one or more retries)" if retried else ""
+    await _reply(ctx, f"✅ Connected to {ctx.author.voice.channel.name}.{suffix}", ephemeral=True)
+    # Enable persistent reconnect while joined (disable via /leavevoice)
+    try:
+        _start_watchdog(ctx.guild.id, ch.id)
+    except Exception:
+        pass
 
 @bot.slash_command(guild_ids=[GUILD_ID], description="Leave the current voice channel.")
 async def leavevoice(ctx: discord.ApplicationContext):
@@ -205,6 +224,10 @@ async def leavevoice(ctx: discord.ApplicationContext):
     if vc and vc.is_connected():
         try:
             await vc.disconnect(force=True)
+        except Exception:
+            pass
+        try:
+            _stop_watchdog(ctx.guild.id)
         except Exception:
             pass
         await ctx.send_followup(content="👋 Disconnected from voice.", ephemeral=True)
@@ -447,7 +470,7 @@ async def startnotes(ctx: discord.ApplicationContext):
     await ctx.respond("Connecting to voice…", ephemeral=True)
 
     try:
-        vc = await ctx.author.voice.channel.connect(timeout=60.0, reconnect=True)
+        vc, retried = await _connect_voice_with_retry(ch, attempts=0, timeout=60.0, max_total_time=240.0)
     except asyncio.TimeoutError:
         diag = _voice_diag_summary(ctx.guild.id)
         return await _reply(
@@ -459,6 +482,20 @@ async def startnotes(ctx: discord.ApplicationContext):
         )
     except Exception as e:
         return await _reply(ctx, f"❌ Could not join voice: `{type(e).__name__}`", ephemeral=True)
+
+    if not vc:
+        return await _reply(
+            ctx,
+            "Connected, but the voice session looks unstable even after one retry.\n"
+            "Please try `/startnotes` again or change the voice region.",
+            ephemeral=True,
+        )
+
+    # Enable persistent reconnect for the session until /stopnotes
+    try:
+        _start_watchdog(ctx.guild.id, ch.id)
+    except Exception:
+        pass
 
     sid = time.strftime("%Y%m%d_%H%M%S")
     session_dir = f"/app/data/sessions/{sid}"
@@ -508,6 +545,10 @@ async def finished_callback(sink: discord.sinks.Sink, post_channel_id: int, guil
         logger.info(f"Disconnected from voice channel for guild {guild_id}")
     except Exception as e:
         logger.error(f"Failed to disconnect from voice: {e}")
+    try:
+        _stop_watchdog(guild_id)
+    except Exception:
+        pass
 
     # Clear session mapping
     try:
@@ -663,6 +704,18 @@ async def on_socket_response(payload):  # type: ignore[override]
                     meta["session_id"] = d.get("session_id")
                     logger.debug(f"VOICE_STATE_UPDATE: session_id={meta['session_id']}, guild={guild_id}")
                 meta["ts"] = time.time()
+                # Persist last voice endpoint/session for external monitors
+                try:
+                    os.makedirs("/app/data", exist_ok=True)
+                    with open("/app/data/voice_last.json", "w") as f:
+                        json.dump({
+                            "guild_id": int(guild_id),
+                            "endpoint": meta.get("endpoint"),
+                            "session_id": meta.get("session_id"),
+                            "ts": meta.get("ts"),
+                        }, f)
+                except Exception:
+                    pass
 
             if os.environ.get("VOICE_DEBUG", "").strip() == "1":
                 if t == "VOICE_SERVER_UPDATE":
@@ -703,6 +756,131 @@ def _resolve_ips(host: str) -> list[str]:
     except Exception:
         pass
     return ips
+
+async def _await_voice_stable(vc: discord.VoiceClient, min_stable_seconds: float = 1.5, timeout: float = 4.0) -> bool:
+    """Wait briefly after connect() to ensure the voice WS doesn't immediately
+    drop with a 4006 close. Returns True if the connection stays up for
+    `min_stable_seconds` within `timeout`.
+    """
+    end = time.monotonic() + timeout
+    stable_until = None
+    while time.monotonic() < end:
+        if getattr(vc, "is_connected", lambda: False)():
+            # start or extend stability window
+            if stable_until is None:
+                stable_until = time.monotonic() + min_stable_seconds
+            if time.monotonic() >= stable_until:
+                return True
+        else:
+            # reset stability window if we disconnected
+            stable_until = None
+        await asyncio.sleep(0.25)
+    return False
+
+async def _connect_voice_with_retry(
+    channel: discord.VoiceChannel,
+    attempts: int = 2,
+    timeout: float = 45.0,
+    max_total_time: float | None = None,
+) -> tuple[discord.VoiceClient | None, bool]:
+    """Try to connect to voice and wait briefly for a stable session.
+    Returns (vc, retried_flag). When unstable after all attempts, returns (None, retried_flag).
+    """
+    # Defensive: ensure there's no lingering VC for this guild before attempting a new connect.
+    # This helps avoid racey RESUME/IDENTIFY confusion on some regions that can surface as 4006 loops.
+    try:
+        existing_vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
+        if existing_vc:
+            try:
+                await existing_vc.disconnect(force=True)
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+    except Exception:
+        pass
+
+    last_vc: discord.VoiceClient | None = None
+    start_all = time.monotonic()
+    i = 0
+    while True:
+        i += 1
+        try:
+            last_vc = await channel.connect(timeout=timeout, reconnect=True)
+        except Exception:
+            # On any exception, do one more attempt (if available)
+            if attempts == 0 or i < attempts:
+                await asyncio.sleep(0.6)
+                continue
+            return None, i > 1
+
+        if await _await_voice_stable(last_vc):
+            return last_vc, i > 1
+        # Unstable: disconnect and retry once
+        try:
+            await last_vc.disconnect(force=True)
+        except Exception:
+            pass
+        last_vc = None
+        if attempts == 0 or i < attempts:
+            await asyncio.sleep(0.6)
+            if max_total_time is not None and (time.monotonic() - start_all) > max_total_time:
+                return None, i > 1
+            continue
+        return None, i > 1
+    return None, attempts > 1
+
+async def _voice_watchdog(guild_id: int, channel_id: int):
+    """Persistently keep the bot connected to a voice channel for this guild.
+    Tries reconnects whenever the connection drops, with small backoff.
+    """
+    try:
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            return
+        backoff = 1.0
+        while _watchdog_flags.get(guild_id, False):
+            vc = discord.utils.get(bot.voice_clients, guild=guild)
+            ok = bool(vc and vc.is_connected())
+            if ok:
+                backoff = 1.0
+                await asyncio.sleep(2.0)
+                continue
+
+            if guild_id in _watchdog_connecting:
+                await asyncio.sleep(0.5)
+                continue
+            _watchdog_connecting.add(guild_id)
+            try:
+                ch = guild.get_channel(channel_id)
+                if isinstance(ch, discord.VoiceChannel):
+                    new_vc, _ = await _connect_voice_with_retry(ch, attempts=0, timeout=45.0, max_total_time=90.0)
+                    if new_vc:
+                        backoff = 1.0
+                    else:
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 8.0)
+                else:
+                    await asyncio.sleep(2.0)
+            finally:
+                _watchdog_connecting.discard(guild_id)
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.error(f"voice watchdog error (guild {guild_id}): {e}")
+
+def _start_watchdog(guild_id: int, channel_id: int):
+    # idempotent
+    _watchdog_flags[guild_id] = True
+    task = _watchdog_tasks.get(guild_id)
+    if task and not task.done():
+        return
+    _watchdog_tasks[guild_id] = asyncio.create_task(_voice_watchdog(guild_id, channel_id))
+
+def _stop_watchdog(guild_id: int):
+    _watchdog_flags[guild_id] = False
+    task = _watchdog_tasks.pop(guild_id, None)
+    if task and not task.done():
+        task.cancel()
 
 if EXPOSE_DEBUG_CMDS:
     @bot.slash_command(guild_ids=[GUILD_ID], description="Show last voice endpoint and resolved IPs for this guild.")
